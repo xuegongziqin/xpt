@@ -1,0 +1,9 @@
+key.ini
+releases/*
+releases.zip
+task.ico
+xpt.res
+xpt.rc
+xpt.exe
+app.manifest
+Makefile
